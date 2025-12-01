@@ -1,0 +1,3 @@
+fastapi
+pydantic_settings
+uvicorn
