@@ -1,3 +1,6 @@
 fastapi
+httpx
 pydantic_settings
+pytest
+redis
 uvicorn
