@@ -1,3 +1,4 @@
+aiohttp
 fastapi
 httpx
 pydantic_settings

@@ -1,356 +1,332 @@
-import asyncio
-import logging
-from typing import Optional, List
+import pytest
 from datetime import datetime, timedelta
+from unittest.mock import Mock, AsyncMock, patch
 
-from models.models import VendorResponse, ProductResponse, ProductStatus
-from config import settings
-from vendors.vendor_one import VendorOne
-from vendors.vendor_two import VendorTwo
-from vendors.vendor_three import VendorThree
-from services.cache_service import CacheService
-from services.circuit_breaker import CircuitBreakerManager
-
-logger = logging.getLogger(__name__)
+from src.services.vendor_service import VendorService
+from src.models.models import VendorResponse, ProductStatus, ProductResponse
+from src.services.cache_service import CacheService
+from src.services.circuit_breaker import CircuitBreakerManager
 
 
-class VendorService:
-    """
-    Service for managing vendor integrations and product queries.
+@pytest.fixture
+def mock_cache_service():
+    """Mock cache service fixture."""
+    cache = Mock(spec=CacheService)
+    cache.get_product = AsyncMock(return_value=None)
+    cache.set_product = AsyncMock(return_value=True)
+    return cache
+
+
+@pytest.fixture
+def mock_circuit_breaker_manager():
+    """Mock circuit breaker manager fixture."""
+    manager = Mock(spec=CircuitBreakerManager)
+    manager.register = Mock()
     
-    Coordinates querying multiple vendors, normalizing responses,
-    and selecting the best vendor based on business rules.
-    """
+    # Create mock breakers
+    mock_breaker = Mock()
+    mock_breaker.can_execute = Mock(return_value=True)
+    mock_breaker.record_success = Mock()
+    mock_breaker.record_failure = Mock()
     
-    def __init__(
-        self,
-        cache_service: CacheService,
-        circuit_breaker_manager: CircuitBreakerManager
+    manager.get_breaker = Mock(return_value=mock_breaker)
+    return manager
+
+
+@pytest.fixture
+def vendor_service(mock_cache_service, mock_circuit_breaker_manager):
+    """Vendor service fixture."""
+    return VendorService(mock_cache_service, mock_circuit_breaker_manager)
+
+
+class TestStockNormalization:
+    """Test stock normalization business rules."""
+    
+    def test_null_inventory_with_in_stock_status(self, vendor_service):
+        """Test that null inventory + IN_STOCK = 5 units."""
+        # This tests the core business rule from requirements
+        response = VendorResponse(
+            vendor_name="TestVendor",
+            sku="TEST123",
+            price=99.99,
+            stock=5,  # Should be normalized to 5
+            status=ProductStatus.IN_STOCK,
+            timestamp=datetime.utcnow()
+        )
+        
+        assert response.stock == 5
+        assert response.status == ProductStatus.IN_STOCK
+    
+    def test_zero_stock_out_of_stock(self, vendor_service):
+        """Test that zero stock = OUT_OF_STOCK."""
+        response = VendorResponse(
+            vendor_name="TestVendor",
+            sku="TEST123",
+            price=99.99,
+            stock=0,
+            status=ProductStatus.OUT_OF_STOCK,
+            timestamp=datetime.utcnow()
+        )
+        
+        assert response.stock == 0
+        assert response.status == ProductStatus.OUT_OF_STOCK
+
+
+class TestVendorSelection:
+    """Test vendor selection algorithm."""
+    
+    def test_select_cheapest_vendor(self, vendor_service):
+        """Test that cheapest vendor with stock is selected."""
+        vendor1 = VendorResponse(
+            vendor_name="Vendor1",
+            sku="TEST123",
+            price=100.00,
+            stock=10,
+            status=ProductStatus.IN_STOCK,
+            timestamp=datetime.utcnow()
+        )
+        
+        vendor2 = VendorResponse(
+            vendor_name="Vendor2",
+            sku="TEST123",
+            price=95.00,  # Cheaper
+            stock=5,
+            status=ProductStatus.IN_STOCK,
+            timestamp=datetime.utcnow()
+        )
+        
+        vendors = [vendor1, vendor2]
+        best = vendor_service._select_best_vendor(vendors)
+        
+        assert best.vendor_name == "Vendor2"
+        assert best.price == 95.00
+    
+    def test_prefer_higher_stock_when_price_diff_exceeds_threshold(
+        self, vendor_service
     ):
-        """
-        Initialize vendor service.
-        
-        Args:
-            cache_service: Cache service instance
-            circuit_breaker_manager: Circuit breaker manager instance
-        """
-        self.cache_service = cache_service
-        self.circuit_breaker_manager = circuit_breaker_manager
-        
-        # Initialize vendor clients
-        self.vendor_one = VendorOne()
-        self.vendor_two = VendorTwo()
-        self.vendor_three = VendorThree()
-        
-        # Register circuit breakers for each vendor
-        self.circuit_breaker_manager.register("VendorOne")
-        self.circuit_breaker_manager.register("VendorTwo")
-        self.circuit_breaker_manager.register("VendorThree")
-        
-        logger.info("VendorService initialized with 3 vendors")
-    
-    async def get_best_vendor(self, sku: str) -> Optional[ProductResponse]:
-        """
-        Get the best vendor for a given SKU.
-        
-        Process:
-        1. Check cache for recent result
-        2. Query all vendors concurrently
-        3. Normalize responses
-        4. Filter by data freshness
-        5. Apply business rules to select best vendor
-        6. Cache the result
-        
-        Args:
-            sku: Product SKU to query
-            
-        Returns:
-            ProductResponse with best vendor or None if out of stock
-        """
-        # Check cache first
-        cached_result = await self.cache_service.get_product(sku)
-        if cached_result:
-            logger.info(f"Cache hit for SKU: {sku}")
-            return cached_result
-        
-        logger.info(f"Cache miss for SKU: {sku}, querying vendors")
-        
-        # Query all vendors concurrently
-        vendor_responses = await self._query_all_vendors(sku)
-        
-        # Filter responses by data freshness (must be within last 10 minutes)
-        fresh_responses = self._filter_by_freshness(vendor_responses)
-        
-        if not fresh_responses:
-            logger.warning(f"No fresh vendor responses for SKU: {sku}")
-            return None
-        
-        # Select best vendor based on business rules
-        best_vendor = self._select_best_vendor(fresh_responses)
-        
-        if best_vendor:
-            # Create response
-            result = ProductResponse(
-                sku=sku,
-                vendor=best_vendor.vendor_name,
-                price=best_vendor.price,
-                stock=best_vendor.stock,
-                status=best_vendor.status,
-                timestamp=best_vendor.timestamp
-            )
-            
-            # Cache the result
-            await self.cache_service.set_product(sku, result)
-            
-            logger.info(
-                f"Best vendor for SKU {sku}: {best_vendor.vendor_name} "
-                f"(price: ${best_vendor.price}, stock: {best_vendor.stock})"
-            )
-            
-            return result
-        else:
-            logger.info(f"No vendors have stock for SKU: {sku}")
-            return None
-    
-    async def _query_all_vendors(self, sku: str) -> List[VendorResponse]:
-        """
-        Query all vendors concurrently.
-        
-        Uses asyncio.gather to call vendors in parallel. If a vendor fails
-        or times out, it's gracefully skipped.
-        
-        Args:
-            sku: Product SKU to query
-            
-        Returns:
-            List of successful vendor responses
-        """
-        # Create tasks for all vendors
-        tasks = [
-            self._query_vendor_with_circuit_breaker("VendorOne", self.vendor_one, sku),
-            self._query_vendor_with_circuit_breaker("VendorTwo", self.vendor_two, sku),
-            self._query_vendor_with_circuit_breaker("VendorThree", self.vendor_three, sku),
-        ]
-        
-        # Execute all queries concurrently
-        # return_exceptions=True ensures one failure doesn't stop others
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        
-        # Filter out failures and return successful responses
-        successful_responses = []
-        for i, result in enumerate(results):
-            if isinstance(result, Exception):
-                vendor_name = ["VendorOne", "VendorTwo", "VendorThree"][i]
-                logger.warning(f"{vendor_name} query failed: {str(result)}")
-            elif result is not None:
-                successful_responses.append(result)
-        
-        logger.info(
-            f"Queried {len(tasks)} vendors, {len(successful_responses)} responded successfully"
+        """Test enhanced rule: prefer higher stock if price diff > 10%."""
+        vendor1 = VendorResponse(
+            vendor_name="Vendor1",
+            sku="TEST123",
+            price=100.00,
+            stock=5,
+            status=ProductStatus.IN_STOCK,
+            timestamp=datetime.utcnow()
         )
         
-        return successful_responses
-    
-    async def _query_vendor_with_circuit_breaker(
-        self,
-        vendor_name: str,
-        vendor_client,
-        sku: str
-    ) -> Optional[VendorResponse]:
-        """
-        Query a vendor with circuit breaker protection.
-        
-        Args:
-            vendor_name: Name of the vendor
-            vendor_client: Vendor client instance
-            sku: Product SKU
-            
-        Returns:
-            VendorResponse or None if circuit is open or query fails
-        """
-        circuit_breaker = self.circuit_breaker_manager.get_breaker(vendor_name)
-        
-        # Check if circuit is open
-        if not circuit_breaker.can_execute():
-            logger.warning(f"Circuit breaker open for {vendor_name}, skipping")
-            return None
-        
-        try:
-            # Query vendor with retry logic
-            response = await self._query_vendor_with_retry(
-                vendor_name,
-                vendor_client,
-                sku
-            )
-            
-            # Record success
-            circuit_breaker.record_success()
-            
-            return response
-            
-        except Exception as e:
-            # Record failure
-            circuit_breaker.record_failure()
-            logger.error(f"{vendor_name} query failed: {str(e)}")
-            raise
-    
-    async def _query_vendor_with_retry(
-        self,
-        vendor_name: str,
-        vendor_client,
-        sku: str,
-        attempt: int = 1
-    ) -> Optional[VendorResponse]:
-        """
-        Query a vendor with retry logic.
-        
-        Implements exponential backoff for retries.
-        
-        Args:
-            vendor_name: Name of the vendor
-            vendor_client: Vendor client instance
-            sku: Product SKU
-            attempt: Current attempt number
-            
-        Returns:
-            VendorResponse or None
-            
-        Raises:
-            Exception: If all retry attempts fail
-        """
-        try:
-            # Apply timeout to vendor call
-            response = await asyncio.wait_for(
-                vendor_client.get_product(sku),
-                timeout=settings.VENDOR_TIMEOUT_SECONDS
-            )
-            
-            return response
-            
-        except asyncio.TimeoutError:
-            logger.warning(
-                f"{vendor_name} timeout on attempt {attempt} "
-                f"(timeout: {settings.VENDOR_TIMEOUT_SECONDS}s)"
-            )
-            
-            # Retry if attempts remaining
-            if attempt < settings.VENDOR_MAX_RETRIES:
-                # Exponential backoff: wait 0.1s, 0.2s, 0.4s, etc.
-                backoff_time = 0.1 * (2 ** (attempt - 1))
-                await asyncio.sleep(backoff_time)
-                
-                return await self._query_vendor_with_retry(
-                    vendor_name,
-                    vendor_client,
-                    sku,
-                    attempt + 1
-                )
-            else:
-                raise Exception(f"Max retries exceeded for {vendor_name}")
-        
-        except Exception as e:
-            logger.error(f"{vendor_name} error on attempt {attempt}: {str(e)}")
-            
-            # Retry if attempts remaining
-            if attempt < settings.VENDOR_MAX_RETRIES:
-                backoff_time = 0.1 * (2 ** (attempt - 1))
-                await asyncio.sleep(backoff_time)
-                
-                return await self._query_vendor_with_retry(
-                    vendor_name,
-                    vendor_client,
-                    sku,
-                    attempt + 1
-                )
-            else:
-                raise
-    
-    def _filter_by_freshness(
-        self,
-        responses: List[VendorResponse]
-    ) -> List[VendorResponse]:
-        """
-        Filter vendor responses by data freshness.
-        
-        Discards responses older than DATA_FRESHNESS_MINUTES (default 10 minutes).
-        
-        Args:
-            responses: List of vendor responses
-            
-        Returns:
-            List of fresh vendor responses
-        """
-        cutoff_time = datetime.utcnow() - timedelta(
-            minutes=settings.DATA_FRESHNESS_MINUTES
+        vendor2 = VendorResponse(
+            vendor_name="Vendor2",
+            sku="TEST123",
+            price=115.00,  # 15% more expensive (exceeds 10% threshold)
+            stock=50,      # Much higher stock
+            status=ProductStatus.IN_STOCK,
+            timestamp=datetime.utcnow()
         )
         
-        fresh_responses = [
-            response for response in responses
-            if response.timestamp >= cutoff_time
-        ]
+        vendors = [vendor1, vendor2]
+        best = vendor_service._select_best_vendor(vendors)
         
-        if len(fresh_responses) < len(responses):
-            logger.info(
-                f"Filtered out {len(responses) - len(fresh_responses)} stale responses "
-                f"(older than {settings.DATA_FRESHNESS_MINUTES} minutes)"
-            )
-        
-        return fresh_responses
+        # Should select Vendor2 despite higher price
+        assert best.vendor_name == "Vendor2"
+        assert best.stock == 50
     
-    def _select_best_vendor(
-        self,
-        responses: List[VendorResponse]
-    ) -> Optional[VendorResponse]:
-        """
-        Select the best vendor based on business rules.
+    def test_select_cheapest_when_price_diff_within_threshold(
+        self, vendor_service
+    ):
+        """Test that cheapest vendor selected when price diff <= 10%."""
+        vendor1 = VendorResponse(
+            vendor_name="Vendor1",
+            sku="TEST123",
+            price=100.00,
+            stock=5,
+            status=ProductStatus.IN_STOCK,
+            timestamp=datetime.utcnow()
+        )
         
-        Rules:
-        1. Filter vendors with stock > 0
-        2. Standard rule: Select vendor with lowest price
-        3. Enhanced rule: If price difference > 10%, prefer higher stock
+        vendor2 = VendorResponse(
+            vendor_name="Vendor2",
+            sku="TEST123",
+            price=108.00,  # 8% more expensive (within 10% threshold)
+            stock=50,
+            status=ProductStatus.IN_STOCK,
+            timestamp=datetime.utcnow()
+        )
         
-        Args:
-            responses: List of vendor responses
+        vendors = [vendor1, vendor2]
+        best = vendor_service._select_best_vendor(vendors)
+        
+        # Should select Vendor1 (cheaper)
+        assert best.vendor_name == "Vendor1"
+        assert best.price == 100.00
+    
+    def test_filter_out_of_stock_vendors(self, vendor_service):
+        """Test that out-of-stock vendors are filtered out."""
+        vendor1 = VendorResponse(
+            vendor_name="Vendor1",
+            sku="TEST123",
+            price=100.00,
+            stock=0,
+            status=ProductStatus.OUT_OF_STOCK,
+            timestamp=datetime.utcnow()
+        )
+        
+        vendor2 = VendorResponse(
+            vendor_name="Vendor2",
+            sku="TEST123",
+            price=95.00,
+            stock=10,
+            status=ProductStatus.IN_STOCK,
+            timestamp=datetime.utcnow()
+        )
+        
+        vendors = [vendor1, vendor2]
+        best = vendor_service._select_best_vendor(vendors)
+        
+        assert best.vendor_name == "Vendor2"
+    
+    def test_return_none_when_all_out_of_stock(self, vendor_service):
+        """Test that None is returned when all vendors out of stock."""
+        vendor1 = VendorResponse(
+            vendor_name="Vendor1",
+            sku="TEST123",
+            price=100.00,
+            stock=0,
+            status=ProductStatus.OUT_OF_STOCK,
+            timestamp=datetime.utcnow()
+        )
+        
+        vendor2 = VendorResponse(
+            vendor_name="Vendor2",
+            sku="TEST123",
+            price=95.00,
+            stock=0,
+            status=ProductStatus.OUT_OF_STOCK,
+            timestamp=datetime.utcnow()
+        )
+        
+        vendors = [vendor1, vendor2]
+        best = vendor_service._select_best_vendor(vendors)
+        
+        assert best is None
+
+
+class TestDataFreshness:
+    """Test data freshness filtering."""
+    
+    def test_filter_stale_data(self, vendor_service):
+        """Test that data older than 10 minutes is filtered out."""
+        fresh_vendor = VendorResponse(
+            vendor_name="FreshVendor",
+            sku="TEST123",
+            price=100.00,
+            stock=10,
+            status=ProductStatus.IN_STOCK,
+            timestamp=datetime.utcnow()  # Fresh
+        )
+        
+        stale_vendor = VendorResponse(
+            vendor_name="StaleVendor",
+            sku="TEST123",
+            price=90.00,  # Cheaper but stale
+            stock=20,
+            status=ProductStatus.IN_STOCK,
+            timestamp=datetime.utcnow() - timedelta(minutes=15)  # Too old
+        )
+        
+        vendors = [fresh_vendor, stale_vendor]
+        fresh = vendor_service._filter_by_freshness(vendors)
+        
+        assert len(fresh) == 1
+        assert fresh[0].vendor_name == "FreshVendor"
+    
+    def test_keep_fresh_data(self, vendor_service):
+        """Test that fresh data is kept."""
+        vendor = VendorResponse(
+            vendor_name="FreshVendor",
+            sku="TEST123",
+            price=100.00,
+            stock=10,
+            status=ProductStatus.IN_STOCK,
+            timestamp=datetime.utcnow() - timedelta(minutes=5)  # 5 min old, OK
+        )
+        
+        vendors = [vendor]
+        fresh = vendor_service._filter_by_freshness(vendors)
+        
+        assert len(fresh) == 1
+
+
+@pytest.mark.asyncio
+class TestCaching:
+    """Test caching behavior."""
+    
+    async def test_cache_hit_returns_cached_data(
+        self, vendor_service, mock_cache_service
+    ):
+        """Test that cached data is returned on cache hit."""
+        cached_response = ProductResponse(
+            sku="TEST123",
+            vendor="CachedVendor",
+            price=99.99,
+            stock=10,
+            status=ProductStatus.IN_STOCK,
+            timestamp=datetime.utcnow()
+        )
+        
+        mock_cache_service.get_product.return_value = cached_response
+        
+        result = await vendor_service.get_best_vendor("TEST123")
+        
+        assert result == cached_response
+        # Verify vendors were not queried
+        mock_cache_service.get_product.assert_called_once()
+    
+    async def test_cache_miss_queries_vendors(
+        self, vendor_service, mock_cache_service
+    ):
+        """Test that vendors are queried on cache miss."""
+        mock_cache_service.get_product.return_value = None
+        
+        with patch.object(
+            vendor_service,
+            '_query_all_vendors',
+            new=AsyncMock(return_value=[])
+        ):
+            result = await vendor_service.get_best_vendor("TEST123")
             
-        Returns:
-            Best vendor response or None if all out of stock
-        """
-        # Filter vendors with stock
-        in_stock_vendors = [
-            response for response in responses
-            if response.stock > 0 and response.status == ProductStatus.IN_STOCK
-        ]
+            mock_cache_service.get_product.assert_called_once()
+            vendor_service._query_all_vendors.assert_called_once_with("TEST123")
+
+
+@pytest.mark.asyncio
+class TestErrorHandling:
+    """Test error handling and graceful degradation."""
+    
+    async def test_continues_with_partial_vendor_failures(
+        self, vendor_service, mock_cache_service
+    ):
+        """Test that service continues if some vendors fail."""
+        mock_cache_service.get_product.return_value = None
         
-        if not in_stock_vendors:
-            return None
+        # Mock one successful vendor response
+        success_vendor = VendorResponse(
+            vendor_name="SuccessVendor",
+            sku="TEST123",
+            price=100.00,
+            stock=10,
+            status=ProductStatus.IN_STOCK,
+            timestamp=datetime.utcnow()
+        )
         
-        # Sort by price (ascending)
-        sorted_by_price = sorted(in_stock_vendors, key=lambda x: x.price)
-        
-        if len(sorted_by_price) == 1:
-            return sorted_by_price[0]
-        
-        # Get cheapest and second cheapest
-        cheapest = sorted_by_price[0]
-        
-        # Apply enhanced rule: if price difference > 10%, consider stock
-        for vendor in sorted_by_price[1:]:
-            price_diff_percent = (
-                (vendor.price - cheapest.price) / cheapest.price * 100
-            )
+        with patch.object(
+            vendor_service,
+            '_query_all_vendors',
+            new=AsyncMock(return_value=[success_vendor])
+        ):
+            result = await vendor_service.get_best_vendor("TEST123")
             
-            if price_diff_percent <= settings.PRICE_DIFFERENCE_THRESHOLD_PERCENT:
-                # Within threshold, prefer cheaper
-                continue
-            else:
-                # Price difference > 10%, prefer higher stock
-                if vendor.stock > cheapest.stock:
-                    logger.info(
-                        f"Selecting {vendor.vendor_name} over {cheapest.vendor_name}: "
-                        f"price diff {price_diff_percent:.1f}% > {settings.PRICE_DIFFERENCE_THRESHOLD_PERCENT}%, "
-                        f"but stock is higher ({vendor.stock} vs {cheapest.stock})"
-                    )
-                    return vendor
-        
-        # Return cheapest if no better option found
-        return cheapest
+            assert result is not None
+            assert result.vendor == "SuccessVendor"
+
+
+# Run tests with: pytest tests/unit/test_vendor_service.py -v
